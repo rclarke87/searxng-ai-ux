@@ -111,13 +111,13 @@
     ]
   },
   "src/js/plugin/QuickSummary.ts": {
-    "file": "chunk/zqe8pfDB.min.js",
+    "file": "chunk/zmUO2VbJ.min.js",
     "name": "quicksummary",
     "src": "src/js/plugin/QuickSummary.ts",
     "isDynamicEntry": true,
     "imports": [
       "src/js/index.ts",
-      "_gZqIRpW1.min.js"
+      "_chlzpS6K.min.js"
     ]
   },
   "src/less/rss.less": {

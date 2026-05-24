@@ -151,8 +151,9 @@ async def call_openai_compatible_api(
         
         headers = {
             'Content-Type': 'application/json',
-            'Authorization': f'Bearer {api_key}'
         }
+        if api_key:
+            headers['Authorization'] = f'Bearer {api_key}'
         
         payload = {
             'model': model,
@@ -242,7 +243,11 @@ async def generate_summary(
     if not results:
         return {'summary': '', 'citations': [], 'error': 'No results to summarize', 'cached': False}
     
-    if not api_config.get('api_key'):
+    if not api_config.get('api_key') and api_config.get('api_base_url', '').startswith(('http://localhost', 'http://127.0.0.1')):
+        # Local models like Ollama don't require an API key
+        pass
+    elif not api_config.get('api_key'):
+        # Cloud APIs require an API key
         return {'summary': '', 'citations': [], 'error': 'API key not configured', 'cached': False}
     
     # Limit results
