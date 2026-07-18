@@ -163,8 +163,8 @@ export default class QuickSummary extends Plugin {
     if (data.citations && data.citations.length > 0) {
       const translations = (window as any).translations || {};
       citationsHtml = `
-        <div class="quick-summary-citations">
-          <h5>${translations.Sources || 'Sources'}</h5>
+        <details class="quick-summary-citations">
+          <summary>${translations.Sources || 'Sources'} (${data.citations.length})</summary>
           <ul>
             ${data.citations.map((c: any, i: number) => `
               <li>
@@ -173,7 +173,7 @@ export default class QuickSummary extends Plugin {
               </li>
             `).join('')}
           </ul>
-        </div>
+        </details>
       `;
     }
 

@@ -521,11 +521,17 @@ html.no-js #clear_search.hide_if_nojs {
   padding-top: 16px;
   border-top: 1px solid var(--color-result-border);
 
-  h5 {
-    margin: 0 0 12px 0;
+  summary {
+    margin: 0;
     color: var(--color-base-font);
     font-size: 1em;
     font-weight: 600;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  &[open] summary {
+    margin-bottom: 12px;
   }
 
   ul {
