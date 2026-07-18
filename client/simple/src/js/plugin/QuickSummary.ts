@@ -38,25 +38,94 @@ export default class QuickSummary extends Plugin {
     }));
 
     try {
-      // Call async endpoint
+      // Call streaming endpoint
       const res = await http("POST", "/quick_summary", {
         body: JSON.stringify({ q: query, results }),
-        timeout: 35000
+        timeout: 60000
       });
 
-      const data = await res.json();
-
-      if (data.error) {
-        this.showError(data.error);
-      } else {
-        this.renderSummary(data);
+      if (!res.body) {
+        const data = await res.json();
+        if (data.error) {
+          this.showError(data.error);
+        } else {
+          this.renderSummary(data);
+        }
+        return true;
       }
+
+      await this.streamSummary(res.body, bodyElement);
     } catch (error) {
       console.error("Quick Summary error:", error);
       this.showError("Failed to generate summary. Please try again.");
     }
 
     return true;
+  }
+
+  private async streamSummary(body: ReadableStream<Uint8Array>, bodyElement: HTMLElement): Promise<void> {
+    // Render an empty shell to append progressive text into.
+    bodyElement.innerHTML = `
+      <div class="quick-summary-content">
+        <div class="quick-summary-text" id="quick_summary_text"></div>
+      </div>
+    `;
+    const textElement = bodyElement.querySelector<HTMLElement>("#quick_summary_text");
+    if (!textElement) return;
+
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let accumulatedText = "";
+    let finalData: any = null;
+    let sawError = false;
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      let sepIndex: number;
+      while ((sepIndex = buffer.indexOf("\n\n")) !== -1) {
+        const rawEvent = buffer.slice(0, sepIndex);
+        buffer = buffer.slice(sepIndex + 2);
+
+        const line = rawEvent.split("\n").find((l) => l.startsWith("data:"));
+        if (!line) continue;
+        const jsonStr = line.slice("data:".length).trim();
+        if (!jsonStr) continue;
+
+        let event: any;
+        try {
+          event = JSON.parse(jsonStr);
+        } catch {
+          continue;
+        }
+
+        if (event.type === "delta") {
+          accumulatedText += event.text;
+          // textContent auto-escapes; safe for progressive raw display.
+          textElement.textContent = accumulatedText;
+        } else if (event.type === "done") {
+          finalData = event;
+        } else if (event.type === "error") {
+          sawError = true;
+          this.showError(event.error);
+          return;
+        }
+      }
+    }
+
+    if (sawError) return;
+
+    if (finalData) {
+      // Final pass reuses the existing citation-aware renderer.
+      this.renderSummary(finalData);
+    } else if (accumulatedText) {
+      this.renderSummary({ summary: accumulatedText, citations: [] });
+    } else {
+      this.showError("Failed to generate summary. Please try again.");
+    }
   }
 
   protected async post(_result: boolean): Promise<void> {

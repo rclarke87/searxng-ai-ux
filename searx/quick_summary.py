@@ -211,6 +211,146 @@ async def call_openai_compatible_api(
         return {'text': '', 'error': f'Unexpected error: {str(e)}'}
 
 
+class QuickSummaryStreamError(Exception):
+    """Raised when a streaming LLM call fails; message is user-facing."""
+
+
+async def call_openai_compatible_api_stream(
+    api_url: str,
+    api_key: str,
+    model: str,
+    prompt: str,
+    timeout: float = 30.0
+) -> t.AsyncGenerator[str, None]:
+    """Call an OpenAI-compatible chat completion API with streaming enabled.
+
+    Yields text deltas as they arrive. Raises QuickSummaryStreamError on failure.
+    """
+    if not api_url.endswith('/chat/completions'):
+        api_url = api_url.rstrip('/') + '/chat/completions'
+
+    headers = {'Content-Type': 'application/json'}
+    if api_key:
+        headers['Authorization'] = f'Bearer {api_key}'
+
+    payload = {
+        'model': model,
+        'messages': [{'role': 'user', 'content': prompt}],
+        'temperature': 0.3,
+        'max_tokens': 1000,
+        'stream': True,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream('POST', api_url, headers=headers, json=payload) as response:
+                if response.status_code == 401:
+                    raise QuickSummaryStreamError('Invalid API key. Please check your credentials.')
+                if response.status_code == 429:
+                    raise QuickSummaryStreamError('Rate limit exceeded. Please try again later.')
+                if response.status_code >= 500:
+                    raise QuickSummaryStreamError('API server error. Please try again.')
+                response.raise_for_status()
+
+                async for line in response.aiter_lines():
+                    if not line or not line.startswith('data:'):
+                        continue
+                    data_str = line[len('data:'):].strip()
+                    if data_str == '[DONE]':
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = chunk.get('choices') or []
+                    if not choices:
+                        continue
+                    piece = (choices[0].get('delta') or {}).get('content')
+                    if piece:
+                        yield piece
+    except QuickSummaryStreamError:
+        raise
+    except httpx.TimeoutException as e:
+        log.error(f"LLM API stream timeout: {e}")
+        raise QuickSummaryStreamError('API request timed out. Please try again.') from e
+    except httpx.HTTPStatusError as e:
+        log.error(f"LLM API stream HTTP error: {e.response.status_code}")
+        raise QuickSummaryStreamError(f'API error: {e.response.status_code}') from e
+    except httpx.RequestError as e:
+        log.error(f"LLM API stream request error: {e}")
+        raise QuickSummaryStreamError('Failed to connect to API. Please check your API URL.') from e
+
+
+async def generate_summary_stream(
+    query: str,
+    results: list[dict],
+    api_config: dict,
+    max_results: int,
+    custom_prompt: str = ''
+) -> t.AsyncGenerator[dict, None]:
+    """Generate a summary of search results, streaming incremental events.
+
+    Yields dicts of one of these shapes:
+        {'type': 'delta', 'text': str}
+        {'type': 'done', 'summary': str, 'citations': list}
+        {'type': 'error', 'error': str}
+    """
+    if not query:
+        yield {'type': 'error', 'error': 'No query provided'}
+        return
+    if not results:
+        yield {'type': 'error', 'error': 'No results to summarize'}
+        return
+
+    if not api_config.get('api_key') and api_config.get('api_base_url', '').startswith(('http://localhost', 'http://127.0.0.1')):
+        pass
+    elif not api_config.get('api_key'):
+        yield {'type': 'error', 'error': 'API key not configured'}
+        return
+
+    results = results[:max_results]
+
+    cache_key = get_cache_key(query, max_results)
+    cached_result = _summary_cache.get(cache_key)
+    if cached_result:
+        log.info(f"Returning cached summary (stream) for query: {query[:50]}...")
+        yield {'type': 'delta', 'text': cached_result['summary']}
+        yield {'type': 'done', 'summary': cached_result['summary'], 'citations': cached_result['citations']}
+        return
+
+    prompt = create_summary_prompt(query, results, custom_prompt)
+    api_url = api_config.get('api_base_url', '')
+    api_key = api_config.get('api_key', '')
+    model = api_config.get('model', 'gpt-4o-mini')
+
+    full_text_parts: list[str] = []
+    try:
+        async for piece in call_openai_compatible_api_stream(api_url, api_key, model, prompt):
+            full_text_parts.append(piece)
+            yield {'type': 'delta', 'text': piece}
+    except QuickSummaryStreamError as e:
+        yield {'type': 'error', 'error': str(e)}
+        return
+
+    summary_text = ''.join(full_text_parts)
+    parsed = parse_llm_response(summary_text, results)
+
+    if parsed.get('error'):
+        yield {'type': 'error', 'error': parsed['error']}
+        return
+
+    cache_data = {
+        'summary': parsed['summary'],
+        'citations': parsed['citations'],
+        'error': None,
+        'cached': False
+    }
+    _summary_cache.set(cache_key, cache_data, expire=86400)
+
+    log.info(f"Generated streamed summary for query: {query[:50]}...")
+    yield {'type': 'done', 'summary': parsed['summary'], 'citations': parsed['citations']}
+
+
 async def generate_summary(
     query: str,
     results: list[dict],

@@ -913,25 +913,37 @@ def quick_summary_endpoint():
                 'content': r.get('content', '') or r.get('snippet', '')
             })
 
-    # Generate summary using asyncio to call async function
-    try:
+    # Stream summary events (delta/done/error) as Server-Sent Events so the
+    # client can render the AI output incrementally instead of waiting for
+    # the full response.
+    def event_stream():
         loop = asyncio.new_event_loop()
-        summary_data = loop.run_until_complete(
-            searx.quick_summary.generate_summary(
-                query=query,
-                results=results,
-                api_config=api_config,
-                max_results=max_results,
-                use_cache=True,
-                custom_prompt=custom_prompt
-            )
+        asyncio.set_event_loop(loop)
+        agen = searx.quick_summary.generate_summary_stream(
+            query=query,
+            results=results,
+            api_config=api_config,
+            max_results=max_results,
+            custom_prompt=custom_prompt
         )
-        loop.close()
-    except Exception as e:
-        logger.exception(f"Error generating quick summary: {e}")
-        return jsonify({'error': f'Failed to generate summary: {str(e)}'}), 500
+        try:
+            while True:
+                try:
+                    event = loop.run_until_complete(agen.__anext__())
+                except StopAsyncIteration:
+                    break
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception as e:
+            logger.exception(f"Error streaming quick summary: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'error': f'Failed to generate summary: {str(e)}'})}\n\n"
+        finally:
+            loop.close()
 
-    return jsonify(summary_data)
+    return Response(
+        event_stream(),
+        mimetype='text/event-stream',
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'}
+    )
 
 
 @app.route('/preferences', methods=['GET', 'POST'])
