@@ -1,0 +1,454 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Quick Summary module for LLM-powered search result summarization."""
+
+import typing as t
+import hashlib
+import re
+import httpx
+import json
+
+from searx import logger
+from searx import get_setting
+from searx.cache import ExpireCacheSQLite, ExpireCacheCfg
+
+log = logger.getChild("quick_summary")
+
+# Initialize cache
+_cache_config = ExpireCacheCfg(
+    name='quick_summary',
+    MAXHOLD_TIME=60 * 60 * 24,  # 24 hours
+)
+_summary_cache = ExpireCacheSQLite(_cache_config)
+
+
+def create_summary_prompt(query: str, results: list[dict], custom_prompt: str = '') -> str:
+    """Create a prompt for the LLM with citation instructions.
+    
+    Args:
+        query: The search query
+        results: List of search result dicts
+        custom_prompt: Optional custom prompt template. If provided, will be used instead of default.
+                       Can use {query} and {results_text} as placeholders.
+    
+    Returns:
+        The formatted prompt string
+    """
+    
+    results_text = "\n\n".join([
+        f"Result {i+1}:\n"
+        f"Title: {r.get('title', '')}\n"
+        f"URL: {r.get('url', '')}\n"
+        f"Content: {r.get('content', '')[:200]}"
+        for i, r in enumerate(results)
+    ])
+
+    if custom_prompt and custom_prompt.strip():
+        prompt = custom_prompt.format(query=query, results_text=results_text)
+    else:
+        prompt = f"""Query: {query}
+
+Sources:
+{results_text}"""
+
+    return prompt
+
+
+SUMMARY_SYSTEM_PROMPT = (
+    "You are a search assistant. Answer the user's query in 2-3 sentences — no more. "
+    "Write in British English. "
+    "Plain prose only: no markdown, no bold, no bullets, no headers, no lists. "
+    "Cite sources inline as [1], [2], etc. Pick the most relevant sources; ignore the rest."
+)
+
+
+def _truncate_to_sentences(text: str, max_sentences: int = 2) -> str:
+    """Return at most max_sentences complete sentences from text."""
+    text = text.strip()
+    # Find positions of sentence-ending punctuation followed by space or end-of-string
+    matches = list(re.finditer(r'[.!?](?=\s|$)', text))
+    if not matches or len(matches) < max_sentences:
+        return text
+    cutoff = matches[max_sentences - 1].end()
+    return text[:cutoff].strip()
+
+
+def parse_llm_response(response_text: str, results: list[dict]) -> dict:
+    """Parse LLM response and extract citations.
+    
+    Returns:
+        dict with keys: 'summary' (str), 'citations' (list), 'error' (None)
+    """
+    try:
+        # Extract citation numbers from response
+        citation_matches = re.findall(r'\[(\d+)\]', response_text)
+        
+        citations = []
+        for match in citation_matches:
+            citation_num = int(match)
+            # Validate citation index
+            if 1 <= citation_num <= len(results):
+                result_idx = citation_num - 1
+                if result_idx not in [c.get('result_index') for c in citations]:
+                    # Find where in the text this citation appears
+                    citation_text = extract_citation_text(response_text, citation_num)
+                    citations.append({
+                        'index': citation_num,
+                        'text': citation_text,
+                        'result_index': result_idx,
+                        'title': results[result_idx].get('title', ''),
+                        'url': results[result_idx].get('url', '')
+                    })
+        
+        return {
+            'summary': response_text,
+            'citations': citations,
+            'error': None
+        }
+    except Exception as e:
+        log.error(f"Error parsing LLM response: {e}")
+        return {
+            'summary': response_text,
+            'citations': [],
+            'error': str(e)
+        }
+
+
+def extract_citation_text(text: str, citation_num: int) -> str:
+    """Extract the text around a citation marker."""
+    # Find the citation and get context (up to 50 chars)
+    pattern = re.escape(f"[{citation_num}]")
+    # Build regex pattern without f-string brace escaping
+    regex_pattern = r'.{0,50}' + pattern + r'.{0,50}'
+    match = re.search(regex_pattern, text)
+    if match:
+        return match.group().strip()
+    return ""
+
+
+def get_cache_key(query: str, max_results: int) -> str:
+    """Generate a cache key for the summary request."""
+    key_data = f"{query}:{max_results}"
+    return hashlib.sha256(key_data.encode()).hexdigest()[:32]
+
+
+async def call_openai_compatible_api(
+    api_url: str,
+    api_key: str,
+    model: str,
+    prompt: str,
+    timeout: float = 30.0
+) -> dict:
+    """Call an OpenAI-compatible API asynchronously.
+    
+    Args:
+        api_url: Base URL of the API (e.g., 'https://api.openai.com/v1')
+        api_key: API key for authentication
+        model: Model name to use
+        prompt: The prompt to send
+        timeout: Timeout in seconds
+    
+    Returns:
+        dict with 'text' (str) or 'error' (str)
+    """
+    try:
+        # Ensure URL has correct endpoint
+        if not api_url.endswith('/chat/completions'):
+            api_url = api_url.rstrip('/') + '/chat/completions'
+        
+        headers = {
+            'Content-Type': 'application/json',
+        }
+        if api_key:
+            headers['Authorization'] = f'Bearer {api_key}'
+        
+        payload = {
+            'model': model,
+            'messages': [
+                {'role': 'system', 'content': SUMMARY_SYSTEM_PROMPT},
+                {'role': 'user', 'content': prompt},
+            ],
+            'temperature': 0.3,
+            'max_tokens': 1000,
+        }
+        
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                api_url,
+                headers=headers,
+                json=payload
+            )
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            # Handle different API response formats
+            if 'choices' in data and len(data['choices']) > 0:
+                text = data['choices'][0].get('message', {}).get('content', '')
+                return {'text': text, 'error': None}
+            elif 'output' in data:  # Some APIs use 'output' instead
+                text = data['output'].get('text', '')
+                return {'text': text, 'error': None}
+            else:
+                return {'text': '', 'error': 'Unexpected API response format'}
+    
+    except httpx.TimeoutException as e:
+        log.error(f"LLM API timeout: {e}")
+        return {'text': '', 'error': 'API request timed out. Please try again.'}
+    except httpx.HTTPStatusError as e:
+        log.error(f"LLM API HTTP error: {e.response.status_code}")
+        if e.response.status_code == 401:
+            return {'text': '', 'error': 'Invalid API key. Please check your credentials.'}
+        elif e.response.status_code == 429:
+            return {'text': '', 'error': 'Rate limit exceeded. Please try again later.'}
+        elif e.response.status_code == 500:
+            return {'text': '', 'error': 'API server error. Please try again.'}
+        else:
+            return {'text': '', 'error': f'API error: {e.response.status_code}'}
+    except httpx.RequestError as e:
+        log.error(f"LLM API request error: {e}")
+        return {'text': '', 'error': 'Failed to connect to API. Please check your API URL.'}
+    except json.JSONDecodeError as e:
+        log.error(f"LLM API JSON decode error: {e}")
+        return {'text': '', 'error': 'Invalid API response. Please try again.'}
+    except Exception as e:
+        log.exception(f"Unexpected LLM API error: {e}")
+        return {'text': '', 'error': f'Unexpected error: {str(e)}'}
+
+
+class QuickSummaryStreamError(Exception):
+    """Raised when a streaming LLM call fails; message is user-facing."""
+
+
+async def call_openai_compatible_api_stream(
+    api_url: str,
+    api_key: str,
+    model: str,
+    prompt: str,
+    timeout: float = 30.0
+) -> t.AsyncGenerator[str, None]:
+    """Call an OpenAI-compatible chat completion API with streaming enabled.
+
+    Yields text deltas as they arrive. Raises QuickSummaryStreamError on failure.
+    """
+    if not api_url.endswith('/chat/completions'):
+        api_url = api_url.rstrip('/') + '/chat/completions'
+
+    headers = {'Content-Type': 'application/json'}
+    if api_key:
+        headers['Authorization'] = f'Bearer {api_key}'
+
+    payload = {
+        'model': model,
+        'messages': [
+            {'role': 'system', 'content': SUMMARY_SYSTEM_PROMPT},
+            {'role': 'user', 'content': prompt},
+        ],
+        'temperature': 0.3,
+        'max_tokens': 1000,
+        'stream': True,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream('POST', api_url, headers=headers, json=payload) as response:
+                if response.status_code == 401:
+                    raise QuickSummaryStreamError('Invalid API key. Please check your credentials.')
+                if response.status_code == 429:
+                    raise QuickSummaryStreamError('Rate limit exceeded. Please try again later.')
+                if response.status_code >= 500:
+                    raise QuickSummaryStreamError('API server error. Please try again.')
+                response.raise_for_status()
+
+                async for line in response.aiter_lines():
+                    if not line or not line.startswith('data:'):
+                        continue
+                    data_str = line[len('data:'):].strip()
+                    if data_str == '[DONE]':
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = chunk.get('choices') or []
+                    if not choices:
+                        continue
+                    piece = (choices[0].get('delta') or {}).get('content')
+                    if piece:
+                        yield piece
+    except QuickSummaryStreamError:
+        raise
+    except httpx.TimeoutException as e:
+        log.error(f"LLM API stream timeout: {e}")
+        raise QuickSummaryStreamError('API request timed out. Please try again.') from e
+    except httpx.HTTPStatusError as e:
+        log.error(f"LLM API stream HTTP error: {e.response.status_code}")
+        raise QuickSummaryStreamError(f'API error: {e.response.status_code}') from e
+    except httpx.RequestError as e:
+        log.error(f"LLM API stream request error: {e}")
+        raise QuickSummaryStreamError('Failed to connect to API. Please check your API URL.') from e
+
+
+async def generate_summary_stream(
+    query: str,
+    results: list[dict],
+    api_config: dict,
+    max_results: int,
+    custom_prompt: str = ''
+) -> t.AsyncGenerator[dict, None]:
+    """Generate a summary of search results, streaming incremental events.
+
+    Yields dicts of one of these shapes:
+        {'type': 'delta', 'text': str}
+        {'type': 'done', 'summary': str, 'citations': list}
+        {'type': 'error', 'error': str}
+    """
+    if not query:
+        yield {'type': 'error', 'error': 'No query provided'}
+        return
+    if not results:
+        yield {'type': 'error', 'error': 'No results to summarize'}
+        return
+
+    if not api_config.get('api_key') and api_config.get('api_base_url', '').startswith(('http://localhost', 'http://127.0.0.1')):
+        pass
+    elif not api_config.get('api_key'):
+        yield {'type': 'error', 'error': 'API key not configured'}
+        return
+
+    results = results[:max_results]
+
+    cache_key = get_cache_key(query, max_results)
+    cached_result = _summary_cache.get(cache_key)
+    if cached_result:
+        log.info(f"Returning cached summary (stream) for query: {query[:50]}...")
+        yield {'type': 'delta', 'text': cached_result['summary']}
+        yield {'type': 'done', 'summary': cached_result['summary'], 'citations': cached_result['citations']}
+        return
+
+    prompt = create_summary_prompt(query, results, custom_prompt)
+    api_url = api_config.get('api_base_url', '')
+    api_key = api_config.get('api_key', '')
+    model = api_config.get('model', 'gpt-4o-mini')
+
+    full_text_parts: list[str] = []
+    try:
+        async for piece in call_openai_compatible_api_stream(api_url, api_key, model, prompt):
+            full_text_parts.append(piece)
+    except QuickSummaryStreamError as e:
+        yield {'type': 'error', 'error': str(e)}
+        return
+
+    raw_text = ''.join(full_text_parts)
+    summary_text = _truncate_to_sentences(raw_text, max_sentences=3)
+    parsed = parse_llm_response(summary_text, results)
+
+    if parsed.get('error'):
+        yield {'type': 'error', 'error': parsed['error']}
+        return
+
+    cache_data = {
+        'summary': parsed['summary'],
+        'citations': parsed['citations'],
+        'error': None,
+        'cached': False
+    }
+    _summary_cache.set(cache_key, cache_data, expire=86400)
+
+    log.info(f"Generated streamed summary for query: {query[:50]}...")
+    yield {'type': 'delta', 'text': parsed['summary']}
+    yield {'type': 'done', 'summary': parsed['summary'], 'citations': parsed['citations']}
+
+
+async def generate_summary(
+    query: str,
+    results: list[dict],
+    api_config: dict,
+    max_results: int,
+    use_cache: bool = True,
+    custom_prompt: str = ''
+) -> dict:
+    """Generate a summary of search results using LLM.
+    
+    Args:
+        query: The search query
+        results: List of search result dicts with 'title', 'url', 'content'
+        api_config: Dict with 'api_base_url', 'api_key', 'model'
+        max_results: Number of results to include in summary
+        use_cache: Whether to check cache
+        custom_prompt: Optional custom prompt template to use instead of default
+    
+    Returns:
+        dict with keys:
+            - 'summary': The generated summary text
+            - 'citations': List of citation dicts
+            - 'error': Error message if any, None otherwise
+            - 'cached': Boolean indicating if from cache
+    """
+    # Validate inputs
+    if not query:
+        return {'summary': '', 'citations': [], 'error': 'No query provided', 'cached': False}
+    
+    if not results:
+        return {'summary': '', 'citations': [], 'error': 'No results to summarize', 'cached': False}
+    
+    if not api_config.get('api_key') and api_config.get('api_base_url', '').startswith(('http://localhost', 'http://127.0.0.1')):
+        # Local models like Ollama don't require an API key
+        pass
+    elif not api_config.get('api_key'):
+        # Cloud APIs require an API key
+        return {'summary': '', 'citations': [], 'error': 'API key not configured', 'cached': False}
+    
+    # Limit results
+    results = results[:max_results]
+    
+    # Check cache
+    cache_key = get_cache_key(query, max_results)
+    if use_cache:
+        cached_result = _summary_cache.get(cache_key)
+        if cached_result:
+            log.info(f"Returning cached summary for query: {query[:50]}...")
+            cached_result['cached'] = True
+            return cached_result
+    
+    # Generate prompt
+    prompt = create_summary_prompt(query, results, custom_prompt)
+    
+    # Call LLM API
+    api_url = api_config.get('api_base_url', '')
+    api_key = api_config.get('api_key', '')
+    model = api_config.get('model', 'gpt-4o-mini')
+    
+    api_response = await call_openai_compatible_api(api_url, api_key, model, prompt)
+    
+    if api_response.get('error'):
+        return {
+            'summary': '',
+            'citations': [],
+            'error': api_response['error'],
+            'cached': False
+        }
+    
+    # Parse response
+    summary_text = api_response['text']
+    parsed = parse_llm_response(summary_text, results)
+    
+    if parsed.get('error'):
+        return {
+            'summary': summary_text,
+            'citations': parsed.get('citations', []),
+            'error': parsed['error'],
+            'cached': False
+        }
+    
+    # Store in cache
+    cache_data = {
+        'summary': parsed['summary'],
+        'citations': parsed['citations'],
+        'error': None,
+        'cached': False
+    }
+    _summary_cache.set(cache_key, cache_data, expire=86400)  # 24 hours
+    
+    log.info(f"Generated summary for query: {query[:50]}...")
+    
+    return cache_data

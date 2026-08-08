@@ -180,7 +180,7 @@
     {%- if 'autocomplete' not in locked_preferences -%}
       {%- include 'simple/preferences/autocomplete.html' -%}
     {%- endif -%}
-    {%- if 'favicon_resolver' not in locked_preferences -%}
+    {%- if 'favicon' not in locked_preferences -%}
       {%- include 'simple/preferences/favicon.html' -%}
     {%- endif -%}
     {% if 'safesearch' not in locked_preferences %}
@@ -228,6 +228,12 @@
       {%- include 'simple/preferences/query_in_title.html' -%}
     {%- endif -%}
     {{- plugin_preferences('privacy') -}}
+    {{- tab_footer() -}}
+
+    {# tab: AI Summary #}
+
+    {{- tab_header('maintab', 'ai_summary', _('AI Summary')) -}}
+    {%- include 'simple/preferences/quick_summary.html' -%}
     {{- tab_footer() -}}
 
     {# tab: enignes #}

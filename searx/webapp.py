@@ -43,6 +43,7 @@ from flask.json import jsonify
 from flask_babel import (
     Babel,
     gettext,
+    format_decimal,
 )
 
 import searx
@@ -95,7 +96,8 @@ from searx.preferences import (
 )
 import searx.answerers
 import searx.plugins
-
+import searx.quick_summary
+import asyncio
 
 from searx.metrics import get_engines_stats, get_engine_errors, get_reliabilities, histogram, counter, openmetrics
 from searx.flaskfix import patch_application
@@ -377,10 +379,14 @@ def get_client_settings():
         'theme_static_path': custom_url_for('static', filename='themes/simple'),
         'results_on_new_tab': req_pref.get_value('results_on_new_tab'),
         'favicon_resolver': req_pref.get_value('favicon_resolver'),
+        'advanced_search': req_pref.get_value('advanced_search'),
         'query_in_title': req_pref.get_value('query_in_title'),
         'safesearch': req_pref.get_value('safesearch'),
         'theme': req_pref.get_value('theme'),
         'doi_resolver': get_doi_resolver(),
+        'quick_summary_enabled': req_pref.get_value('quick_summary_enabled'),
+        'quick_summary_max_results': int(req_pref.get_value('quick_summary_max_results') or '10'),
+        'quick_summary_model': req_pref.get_value('quick_summary_model'),
     }
 
 
@@ -562,6 +568,7 @@ def index_error(output_format: str, error_message: str):
             'opensearch_response_rss.xml',
             results=[],
             q=sxng_request.form['q'] if 'q' in sxng_request.form else '',
+            number_of_results=0,
             error_message=error_message,
         )
         return Response(response_rss, mimetype='text/xml')
@@ -721,6 +728,7 @@ def search():
             'opensearch_response_rss.xml',
             results=results,
             q=sxng_request.form['q'],
+            number_of_results=result_container.number_of_results,
         )
         return Response(response_rss, mimetype='text/xml')
 
@@ -749,6 +757,14 @@ def search():
     # search_query.lang contains the user choice (all, auto, en, ...)
     # when the user choice is "auto", search.search_query.lang contains the detected language
     # otherwise it is equals to search_query.lang
+    
+    # Prepare quick summary data for async loading
+    quick_summary_data = {
+        'enabled': sxng_request.preferences.get_value('quick_summary_enabled'),
+        'pending': True,
+        'query': sxng_request.form.get('q', '')
+    }
+    
     return render(
         # fmt: off
         'results.html',
@@ -757,6 +773,7 @@ def search():
         selected_categories = search_query.categories,
         pageno = search_query.pageno,
         time_range = search_query.time_range or '',
+        number_of_results = format_decimal(result_container.number_of_results),
         suggestions = suggestion_urls,
         answers = result_container.answers,
         corrections = correction_urls,
@@ -775,7 +792,8 @@ def search():
         ),
         timeout_limit = sxng_request.form.get('timeout_limit', None),
         timings = engine_timings_pairs,
-        max_response_time = max_response_time
+        max_response_time = max_response_time,
+        quick_summary = quick_summary_data
         # fmt: on
     )
 
@@ -803,7 +821,7 @@ def info(pagename, locale):
     )
 
 
-@app.route('/autocompleter', methods=['GET'])
+@app.route('/autocompleter', methods=['GET', 'POST'])
 def autocompleter():
     """Return autocompleter results"""
 
@@ -845,13 +863,86 @@ def autocompleter():
         mimetype = 'application/json'
     else:
         # the suggestion request comes from browser's URL bar
-        relevances = {
-            'google:suggestrelevance': [600 - i for i in range(len(results))]
-        }  # chromium only shows 3 suggestions unless we attach relevances
-        suggestions = json.dumps([sug_prefix, results, [], [], relevances])
+        suggestions = json.dumps([sug_prefix, results])
         mimetype = 'application/x-suggestions+json'
 
     return Response(suggestions, mimetype=mimetype)
+
+
+@app.route('/quick_summary', methods=['POST'])
+def quick_summary_endpoint():
+    """Endpoint to generate AI summary of search results."""
+    if sxng_request.method != 'POST':
+        return jsonify({'error': 'Method not allowed'}), 405
+
+    try:
+        data = json.loads(sxng_request.get_data(as_text=True))
+    except json.JSONDecodeError:
+        return jsonify({'error': 'Invalid JSON data'}), 400
+
+    query = data.get('q', '').strip()
+    results_data = data.get('results', [])
+    custom_prompt = data.get('custom_prompt', '')
+
+    # Validate quick summary is enabled
+    if not sxng_request.preferences.get_value('quick_summary_enabled'):
+        return jsonify({'error': 'Quick summary is not enabled'}), 403
+
+    # Get API configuration from preferences
+    api_config = {
+        'api_base_url': sxng_request.preferences.get_value('quick_summary_api_base_url'),
+        'api_key': sxng_request.preferences.get_value('quick_summary_api_key'),
+        'model': sxng_request.preferences.get_value('quick_summary_model')
+    }
+
+    # Get max results setting
+    try:
+        max_results = int(sxng_request.preferences.get_value('quick_summary_max_results', '10'))
+        max_results = max(5, min(20, max_results))  # Clamp to 5-20
+    except (ValueError, TypeError):
+        max_results = 10
+
+    # Format results for LLM
+    results = []
+    for r in results_data:
+        if isinstance(r, dict):
+            results.append({
+                'title': r.get('title', ''),
+                'url': r.get('url', ''),
+                'content': r.get('content', '') or r.get('snippet', '')
+            })
+
+    # Stream summary events (delta/done/error) as Server-Sent Events so the
+    # client can render the AI output incrementally instead of waiting for
+    # the full response.
+    def event_stream():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        agen = searx.quick_summary.generate_summary_stream(
+            query=query,
+            results=results,
+            api_config=api_config,
+            max_results=max_results,
+            custom_prompt=custom_prompt
+        )
+        try:
+            while True:
+                try:
+                    event = loop.run_until_complete(agen.__anext__())
+                except StopAsyncIteration:
+                    break
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception as e:
+            logger.exception(f"Error streaming quick summary: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'error': f'Failed to generate summary: {str(e)}'})}\n\n"
+        finally:
+            loop.close()
+
+    return Response(
+        event_stream(),
+        mimetype='text/event-stream',
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'}
+    )
 
 
 @app.route('/preferences', methods=['GET', 'POST'])
@@ -874,10 +965,21 @@ def preferences():
         resp = make_response(redirect(url_for('index', _external=True)))
         try:
             sxng_request.preferences.parse_form(sxng_request.form)
-        except ValidationException:
+        except ValidationException as e:
+            logger.error("ValidationException in preferences: %s", e)
             sxng_request.errors.append(gettext('Invalid settings, please edit your preferences'))
             return resp
-        return sxng_request.preferences.save(resp)
+        except Exception as e:
+            logger.exception("Exception parsing preferences: %s", e)
+            sxng_request.errors.append(gettext('Invalid settings, please edit your preferences'))
+            return resp
+        
+        try:
+            return sxng_request.preferences.save(resp)
+        except Exception as e:
+            logger.exception("Exception saving preferences: %s", e)
+            sxng_request.errors.append(gettext('Error saving preferences. Your custom prompt may be too long.'))
+            return resp
 
     # render preferences
     image_proxy = sxng_request.preferences.get_value('image_proxy')  # pylint: disable=redefined-outer-name
@@ -978,7 +1080,7 @@ def preferences():
         current_doi_resolver = get_doi_resolver(),
         allowed_plugins = allowed_plugins,
         preferences_url_params = sxng_request.preferences.get_as_url_params(),
-        locked_preferences = get_setting("preferences").lock,
+        locked_preferences = get_setting("preferences.lock", []),
         doi_resolvers = get_setting("doi_resolvers", {}),
         # fmt: on
     )
@@ -1077,9 +1179,10 @@ def engine_descriptions():
         result[engine] = description
 
     # overwrite by about:description (from settings)
-    for eng_name, eng_obj in engines.items():
-        if eng_obj.about.description:
-            result[eng_name] = [eng_obj.about.description, "SearXNG config"]
+    for engine_name, engine_mod in engines.items():
+        descr = getattr(engine_mod, 'about', {}).get('description', None)
+        if descr is not None:
+            result[engine_name] = [descr, "SearXNG config"]
 
     return jsonify(result)
 
@@ -1349,8 +1452,6 @@ def run():
 
 def init():
 
-    # pylint: disable=import-outside-toplevel
-
     if searx.sxng_debug or app.debug:
         app.debug = True
         searx.sxng_debug = True
@@ -1361,18 +1462,6 @@ def init():
         logger.error("server.secret_key is not changed. Please use something else instead of ultrasecretkey.")
         sys.exit(1)
 
-    # init database schema first / DB schema is created with the first connect
-    from searx.data import get_cache
-    from searx.enginelib import ENGINES_CACHE
-
-    conn = get_cache().connect()
-    conn.close()
-    conn = ENGINES_CACHE.connect()
-    conn.close()
-
-    favicons.init()
-
-    # init application
     locales_initialize()
     valkey_initialize()
     searx.plugins.initialize(app)
@@ -1381,6 +1470,7 @@ def init():
     searx.search.initialize(check_network=True, enable_metrics=metrics)
 
     limiter.initialize(app, settings)
+    favicons.init()
 
 
 def static_headers(headers: Headers, _path: str, _url: str) -> None:
